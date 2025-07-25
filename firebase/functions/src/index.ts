@@ -924,7 +924,7 @@ export const trackUserInteraction = functions.https.onCall(async (data, context)
     }
 
     // Create interaction record
-    const interactionData = {
+    const interactionData: any = {
       userId,
       reelId,
       type: interactionType,
@@ -1141,7 +1141,7 @@ export const dailyRecommendationJob = functions
         type: 'daily_generation',
         startTime: admin.firestore.Timestamp.fromDate(new Date(context.timestamp)),
         endTime: admin.firestore.FieldValue.serverTimestamp(),
-        error: error.message,
+        error: error instanceof Error ? error.message : 'Unknown error',
         status: 'failed'
       });
       
@@ -1388,7 +1388,7 @@ function localAnalysis(caption: string) {
   const cleanHashtags = hashtags.map(tag => tag.substring(1).toLowerCase());
 
   // Simple topic detection based on keywords
-  const keywordMap = {
+  const keywordMap: { [key: string]: string[] } = {
     dance: ['dance', 'choreography', 'music', 'moves', 'rhythm'],
     comedy: ['funny', 'laugh', 'joke', 'humor', 'hilarious'],
     fitness: ['workout', 'exercise', 'gym', 'fitness', 'health'],
@@ -1454,7 +1454,7 @@ export const updateUserInterests = functions.https.onCall(async (data, context) 
     const userInterestRef = db.collection('user_interests').doc(userId);
     const userInterestDoc = await userInterestRef.get();
 
-    let interestData;
+    let interestData: any;
     if (userInterestDoc.exists) {
       interestData = userInterestDoc.data();
     } else {
@@ -1497,7 +1497,7 @@ async function updateUserInterestsFromContent(userId: string, topics: string[]) 
     const userInterestRef = db.collection('user_interests').doc(userId);
     const userInterestDoc = await userInterestRef.get();
 
-    let interestData;
+    let interestData: any;
     if (userInterestDoc.exists) {
       interestData = userInterestDoc.data();
     } else {
@@ -1856,7 +1856,7 @@ export const processFixedBonus = functions.https.onCall(async (data, context) =>
     const { userId, type, subType, amount, description, reelId, referralUserId } = data;
 
     // Validate bonus amount based on type
-    const bonusLimits = {
+    const bonusLimits: { [key: string]: number } = {
       create: 2, // ₹2 per reel created
       referral_signup: 10, // ₹10 per referral
       daily_streak: 1, // ₹1 per day streak
@@ -2138,3 +2138,284 @@ export const cleanupOldData = functions.pubsub.schedule('every 7 days').onRun(as
     throw error;
   }
 }); 
+
+// ===== AD REVENUE PROCESSING FUNCTIONS =====
+
+/**
+ * Auto-trigger ad revenue processing when a reel view is recorded
+ * Trigger: onCreate for reel_views collection
+ */
+export const processReelViewAdRevenue = functions.firestore
+  .document('reel_views/{viewId}')
+  .onCreate(async (snap, context) => {
+    const viewId = context.params.viewId;
+    const viewData = snap.data();
+
+    try {
+      console.log(`Processing ad revenue for view: ${viewId}`);
+
+      // Get reel data to find the creator
+      const reelDoc = await db.collection('reels').doc(viewData.reelId).get();
+      if (!reelDoc.exists) {
+        console.log(`Reel ${viewData.reelId} not found, skipping ad revenue processing`);
+        return;
+      }
+
+      const reelInfo = reelDoc.data()!;
+
+      // Skip if no ad was shown
+      if (!viewData.adData) {
+        console.log(`No ad data for view ${viewId}, skipping revenue processing`);
+        return;
+      }
+
+      // Prepare ad view data for processing
+      const adViewData = {
+        reelId: viewData.reelId,
+        userId: viewData.userId,
+        creatorId: reelInfo.userId,
+        viewDuration: viewData.duration || 0,
+        videoDuration: reelInfo.duration || 30,
+        adData: viewData.adData,
+        timestamp: viewData.timestamp || admin.firestore.FieldValue.serverTimestamp(),
+        viewQuality: calculateViewQuality(viewData),
+        userLocation: viewData.userLocation || 'IN'
+      };
+
+      // Process the ad revenue
+      const result = await adRevenueProcessor.processReelViewRevenue(adViewData);
+
+      if (result.success) {
+        console.log(`✅ Ad revenue processed successfully for view ${viewId}: ${result.message}`);
+        
+        // Update the view document with processing status
+        await snap.ref.update({
+          adRevenueProcessed: true,
+          adRevenueProcessedAt: admin.firestore.FieldValue.serverTimestamp(),
+          adRevenueDistribution: result.distribution,
+          adRevenueTransactionIds: result.transactionIds
+        });
+
+        // Track successful revenue processing for analytics
+        await db.collection('ad_revenue_analytics').add({
+          viewId,
+          reelId: viewData.reelId,
+          creatorId: reelInfo.userId,
+          viewerId: viewData.userId,
+          totalRevenue: result.distribution?.totalRevenue || 0,
+          processed: true,
+          timestamp: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+      } else {
+        console.log(`❌ Ad revenue processing failed for view ${viewId}: ${result.message}`);
+        
+        // Update view document with failure status
+        await snap.ref.update({
+          adRevenueProcessed: false,
+          adRevenueProcessedAt: admin.firestore.FieldValue.serverTimestamp(),
+          adRevenueError: result.message
+        });
+      }
+
+    } catch (error) {
+      console.error(`Error processing ad revenue for view ${viewId}:`, error);
+      
+      // Update view document with error status
+      await snap.ref.update({
+        adRevenueProcessed: false,
+        adRevenueProcessedAt: admin.firestore.FieldValue.serverTimestamp(),
+        adRevenueError: error instanceof Error ? error.message : 'Unknown error'
+      });
+    }
+  });
+
+/**
+ * Manual ad revenue processing function (HTTP Callable)
+ * For processing views that failed auto-processing or manual triggers
+ */
+export const processAdRevenueManually = functions.https.onCall(async (data, context) => {
+  try {
+    if (!context.auth) {
+      throw new functions.https.HttpsError('unauthenticated', 'Must be authenticated');
+    }
+
+    const { viewId, reelId, userId, creatorId, viewDuration, videoDuration, adData, userLocation } = data;
+
+    // Validate required fields
+    if (!viewId || !reelId || !userId || !creatorId || !adData) {
+      throw new functions.https.HttpsError('invalid-argument', 'Missing required fields');
+    }
+
+    const adViewData = {
+      reelId,
+      userId,
+      creatorId,
+      viewDuration: viewDuration || 0,
+      videoDuration: videoDuration || 30,
+      adData,
+      timestamp: admin.firestore.Timestamp.now(),
+      viewQuality: 0.8, // Default quality
+      userLocation: userLocation || 'IN'
+    };
+
+    const result = await adRevenueProcessor.processReelViewRevenue(adViewData);
+
+    return {
+      success: result.success,
+      message: result.message,
+      distribution: result.distribution,
+      transactionIds: result.transactionIds
+    };
+
+  } catch (error) {
+    console.error('Manual ad revenue processing error:', error);
+    throw error;
+  }
+});
+
+/**
+ * Get ad revenue analytics (HTTP Callable)
+ */
+export const getAdRevenueAnalytics = functions.https.onCall(async (data, context) => {
+  try {
+    if (!context.auth) {
+      throw new functions.https.HttpsError('unauthenticated', 'Must be authenticated');
+    }
+
+    const { userId, startDate, endDate } = data;
+    
+    const startDateObj = startDate ? new Date(startDate) : undefined;
+    const endDateObj = endDate ? new Date(endDate) : undefined;
+
+    const stats = await adRevenueProcessor.getRevenueStats(userId, startDateObj, endDateObj);
+
+    return {
+      success: true,
+      data: stats,
+      message: 'Analytics retrieved successfully'
+    };
+
+  } catch (error) {
+    console.error('Get ad revenue analytics error:', error);
+    throw new functions.https.HttpsError('internal', 'Failed to get analytics');
+  }
+});
+
+/**
+ * Batch process failed ad revenue views (Admin only)
+ */
+export const batchProcessFailedAdRevenue = functions
+  .runWith({ timeoutSeconds: 540, memory: '1GB' })
+  .https.onCall(async (data, context) => {
+    try {
+      // Check admin authentication
+      if (!context.auth || !context.auth.token.admin) {
+        throw new functions.https.HttpsError('permission-denied', 'Admin access required');
+      }
+
+      const { limit = 100, retryFailed = false } = data;
+
+      // Find views with ads that haven't been processed or failed processing
+      let query = db.collection('reel_views')
+        .where('adData', '!=', null)
+        .limit(limit);
+
+      if (retryFailed) {
+        query = query.where('adRevenueProcessed', '==', false);
+      } else {
+        query = query.where('adRevenueProcessed', '==', null);
+      }
+
+      const viewsSnapshot = await query.get();
+      let processed = 0;
+      let failed = 0;
+
+      for (const viewDoc of viewsSnapshot.docs) {
+        try {
+          const viewData = viewDoc.data();
+          
+          // Get reel data
+          const reelDoc = await db.collection('reels').doc(viewData.reelId).get();
+          if (!reelDoc.exists) {
+            failed++;
+            continue;
+          }
+
+          const reelInfo = reelDoc.data()!;
+
+          const adViewData = {
+            reelId: viewData.reelId,
+            userId: viewData.userId,
+            creatorId: reelInfo.userId,
+            viewDuration: viewData.duration || 0,
+            videoDuration: reelInfo.duration || 30,
+            adData: viewData.adData,
+            timestamp: viewData.timestamp || admin.firestore.Timestamp.now(),
+            viewQuality: calculateViewQuality(viewData),
+            userLocation: viewData.userLocation || 'IN'
+          };
+
+          const result = await adRevenueProcessor.processReelViewRevenue(adViewData);
+
+          if (result.success) {
+            await viewDoc.ref.update({
+              adRevenueProcessed: true,
+              adRevenueProcessedAt: admin.firestore.FieldValue.serverTimestamp(),
+              adRevenueDistribution: result.distribution,
+              adRevenueTransactionIds: result.transactionIds
+            });
+            processed++;
+          } else {
+            await viewDoc.ref.update({
+              adRevenueProcessed: false,
+              adRevenueProcessedAt: admin.firestore.FieldValue.serverTimestamp(),
+              adRevenueError: result.message
+            });
+            failed++;
+          }
+
+        } catch (error) {
+          console.error(`Error processing view ${viewDoc.id}:`, error);
+          failed++;
+        }
+      }
+
+      return {
+        success: true,
+        processed,
+        failed,
+        total: viewsSnapshot.docs.length,
+        message: `Processed ${processed}/${viewsSnapshot.docs.length} views successfully`
+      };
+
+    } catch (error) {
+      console.error('Batch process failed ad revenue error:', error);
+      throw error;
+    }
+  });
+
+/**
+ * Calculate view quality score based on engagement and completion
+ */
+function calculateViewQuality(viewData: any): number {
+  let quality = 0.5; // Base quality
+
+  // Duration factor (longer views = higher quality)
+  if (viewData.duration && viewData.videoDuration) {
+    const completionRate = viewData.duration / viewData.videoDuration;
+    quality += completionRate * 0.3;
+  }
+
+  // Engagement factor
+  if (viewData.liked) quality += 0.1;
+  if (viewData.commented) quality += 0.1;
+  if (viewData.shared) quality += 0.2;
+
+  // User engagement history (if available)
+  if (viewData.userEngagementScore) {
+    quality += viewData.userEngagementScore * 0.2;
+  }
+
+  return Math.min(1.0, Math.max(0.1, quality));
+} 
