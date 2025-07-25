@@ -1,0 +1,81 @@
+{
+  "expo": {
+    "name": "ReelShare",
+    "slug": "reelshare",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#000000"
+    },
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.reelshare.app",
+      "infoPlist": {
+        "NSCameraUsageDescription": "This app needs access to camera to record videos for reels",
+        "NSMicrophoneUsageDescription": "This app needs access to microphone to record audio for reels",
+        "NSPhotoLibraryUsageDescription": "This app needs access to photo library to select videos and images"
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#000000"
+      },
+      "package": "com.reelshare.app",
+      "permissions": [
+        "CAMERA",
+        "RECORD_AUDIO",
+        "READ_EXTERNAL_STORAGE",
+        "WRITE_EXTERNAL_STORAGE",
+        "INTERNET",
+        "ACCESS_NETWORK_STATE",
+        "VIBRATE"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow ReelShare to access your camera to record amazing reels."
+        }
+      ],
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Allow ReelShare to access your photos to share your favorite moments.",
+          "savePhotosPermission": "Allow ReelShare to save reels to your photo library.",
+          "isAccessMediaLocationEnabled": true
+        }
+      ],
+      [
+        "expo-av",
+        {
+          "microphonePermission": "Allow ReelShare to access your microphone to record audio for reels."
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/notification-icon.png",
+          "color": "#ffffff"
+        }
+      ]
+    ],
+    "scheme": "reelshare",
+    "extra": {
+      "eas": {
+        "projectId": "your-project-id-here"
+      }
+    }
+  }
+} 

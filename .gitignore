@@ -1,0 +1,55 @@
+# Expo
+.expo/
+dist/
+web-build/
+
+# Native
+*.orig.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+
+# Metro
+.metro-health-check*
+
+# debug
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+
+# macOS
+.DS_Store
+*.pem
+
+# local env files
+.env*.local
+.env
+
+# typescript
+*.tsbuildinfo
+
+# Node modules
+node_modules/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Firebase
+.firebase/
+firebase-debug.log
+firestore-debug.log
+
+# Build artifacts
+build/
+android/app/build/
+ios/build/
+
+# Dependencies
+yarn.lock
+package-lock.json 
