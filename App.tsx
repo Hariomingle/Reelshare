@@ -1,76 +1,65 @@
 import React, { useEffect, useState } from 'react';
+import { View, StyleSheet, LogBox } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
-import { LogBox, Platform } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
-import * as SplashScreen from 'expo-splash-screen';
-import * as Font from 'expo-font';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
+import * as SplashScreen from 'expo-splash-screen';
 
-// Navigation
-import AppNavigator from './src/navigation/AppNavigator';
+// Import the demo screen
+import ReelsFeedDemo from './src/screens/ReelsFeedDemo';
 
-// Services
-import './src/services/firebase'; // Initialize Firebase
+// Import Firebase service
+import './src/services/firebase';
 
-// Ignore specific warnings in development
-if (__DEV__) {
-  LogBox.ignoreLogs([
-    'Require cycle:', // Common in React Navigation
-    'Remote debugger', // React Native debugger
-    'VirtualizedLists should never be nested', // FlatList warnings
-    'Setting a timer', // Firebase warnings
-  ]);
-}
+// Suppress common development warnings
+LogBox.ignoreLogs([
+  'Non-serializable values were found in the navigation state',
+  'Remote debugger',
+  'Require cycle:',
+]);
 
-// Keep splash screen visible while we fetch resources
+// Keep splash screen visible while loading
 SplashScreen.preventAutoHideAsync();
 
-const App: React.FC = () => {
+export default function App() {
   const [appIsReady, setAppIsReady] = useState(false);
 
   useEffect(() => {
     async function prepare() {
       try {
-        // Pre-load fonts (if you have custom fonts)
-        // await Font.loadAsync({
-        //   'custom-font': require('./assets/fonts/CustomFont.ttf'),
-        // });
-
-        // Pre-load any other resources or make API calls you need
-        // You could also initialize your app state here
-
-        // Artificial delay to show splash screen for minimum time
+        // Simulate loading time
         await new Promise(resolve => setTimeout(resolve, 2000));
       } catch (e) {
-        console.warn('Error during app initialization:', e);
+        console.warn(e);
       } finally {
-        // Tell the application to render
         setAppIsReady(true);
+        SplashScreen.hideAsync();
       }
     }
 
     prepare();
   }, []);
 
-  const onLayoutRootView = React.useCallback(async () => {
-    if (appIsReady) {
-      // This tells the splash screen to hide immediately
-      await SplashScreen.hideAsync();
-    }
-  }, [appIsReady]);
-
   if (!appIsReady) {
     return null;
   }
 
   return (
-    <GestureHandlerRootView style={{ flex: 1 }} onLayout={onLayoutRootView}>
+    <GestureHandlerRootView style={styles.container}>
       <SafeAreaProvider>
-        <StatusBar style="light" backgroundColor="#000000" translucent />
-        <AppNavigator />
+        <StatusBar style="light" backgroundColor="#000000" />
+        <View style={styles.container}>
+          {/* Demo the ReelShare Video Feed */}
+          <ReelsFeedDemo />
+        </View>
       </SafeAreaProvider>
     </GestureHandlerRootView>
   );
-};
+}
 
-export default App; 
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: '#000000',
+  },
+}); 
