@@ -1933,82 +1933,7 @@ export const processFixedBonus = functions.https.onCall(async (data, context) =>
   }
 });
 
-// Get ad revenue analytics
-export const getAdRevenueAnalytics = functions.https.onCall(async (data, context) => {
-  try {
-    if (!context.auth) {
-      throw new functions.https.HttpsError('unauthenticated', 'Must be authenticated');
-    }
-
-    const { startDate, endDate, userId } = data;
-
-    let query = db.collection('ad_revenue_events')
-      .where('isValidView', '==', true);
-
-    if (startDate) {
-      query = query.where('createdAt', '>=', new Date(startDate));
-    }
-
-    if (endDate) {
-      query = query.where('createdAt', '<=', new Date(endDate));
-    }
-
-    if (userId) {
-      query = query.where('creatorId', '==', userId);
-    }
-
-    const querySnapshot = await query.get();
-    const events = querySnapshot.docs.map(doc => doc.data());
-
-    // Calculate analytics
-    const analytics = {
-      totalViews: events.length,
-      totalRevenue: events.reduce((sum, event) => sum + event.revenue, 0),
-      totalCreatorEarnings: events.reduce((sum, event) => sum + (event.revenue * 0.6), 0),
-      totalViewerEarnings: events.reduce((sum, event) => sum + (event.revenue * 0.2), 0),
-      totalAppRevenue: events.reduce((sum, event) => sum + (event.revenue * 0.2), 0),
-      averageCpm: events.length > 0 ? events.reduce((sum, event) => sum + event.cpm, 0) / events.length : 0,
-      revenueByProvider: events.reduce((acc, event) => {
-        acc[event.adProvider] = (acc[event.adProvider] || 0) + event.revenue;
-        return acc;
-      }, {} as any),
-    };
-
-    return {
-      success: true,
-      data: analytics,
-      message: 'Analytics retrieved successfully'
-    };
-
-  } catch (error) {
-    console.error('Analytics error:', error);
-    throw new functions.https.HttpsError('internal', 'Failed to get analytics');
-  }
-});
-
-// Generate video thumbnail (placeholder for future implementation)
-export const generateVideoThumbnail = functions.https.onCall(async (data, context) => {
-  try {
-    if (!context.auth) {
-      throw new functions.https.HttpsError('unauthenticated', 'Must be authenticated');
-    }
-
-    const { videoUrl, reelId } = data;
-
-    // Placeholder for thumbnail generation
-    // In production, you would use a service like Cloudinary or FFmpeg
-    
-    return {
-      success: true,
-      thumbnailUrl: `${videoUrl}?thumbnail=true`,
-      message: 'Thumbnail generated successfully'
-    };
-
-  } catch (error) {
-    console.error('Thumbnail generation error:', error);
-    throw new functions.https.HttpsError('internal', 'Failed to generate thumbnail');
-  }
-});
+// ===== MAINTENANCE AND CLEANUP FUNCTIONS =====
 
 // Scheduled function to update trending content (runs daily)
 export const updateTrendingContent = functions.pubsub.schedule('every 24 hours').onRun(async (context) => {
@@ -2128,104 +2053,238 @@ export const cleanupOldData = functions.pubsub.schedule('every 7 days').onRun(as
       batch.delete(doc.ref);
     });
 
+    // Clean up old referral earnings (keep only last 2 years)
+    const twoYearsAgo = admin.firestore.Timestamp.fromMillis(now.toMillis() - 2 * 365 * 24 * 60 * 60 * 1000);
+    const oldReferralEarningsQuery = db.collection('referral_earnings')
+      .where('date', '<', twoYearsAgo)
+      .limit(1000);
+
+    const oldReferralEarningsSnapshot = await oldReferralEarningsQuery.get();
+    oldReferralEarningsSnapshot.docs.forEach(doc => {
+      batch.delete(doc.ref);
+    });
+
     await batch.commit();
 
-    console.log(`Cleaned up ${oldEventsSnapshot.docs.length} old ad revenue events, ${oldInteractionsSnapshot.docs.length} old interactions, and ${oldRecommendationsSnapshot.docs.length} old recommendations`);
+    console.log(`Cleaned up ${oldEventsSnapshot.docs.length} old ad revenue events, ${oldInteractionsSnapshot.docs.length} old interactions, ${oldRecommendationsSnapshot.docs.length} old recommendations, and ${oldReferralEarningsSnapshot.docs.length} old referral earnings`);
     return null;
 
   } catch (error) {
     console.error('Cleanup error:', error);
     throw error;
   }
-}); 
+});
 
-// ===== AD REVENUE PROCESSING FUNCTIONS =====
+// ===== REFERRAL SYSTEM FUNCTIONS =====
 
 /**
- * Auto-trigger ad revenue processing when a reel view is recorded
- * Trigger: onCreate for reel_views collection
+ * Generate referral code for user
+ * HTTP Callable Function
  */
-export const processReelViewAdRevenue = functions.firestore
-  .document('reel_views/{viewId}')
+export const generateReferralCode = functions.https.onCall(async (data, context) => {
+  try {
+    if (!context.auth) {
+      throw new functions.https.HttpsError('unauthenticated', 'Must be authenticated');
+    }
+
+    const { customCode } = data;
+    const userId = context.auth.uid;
+
+    const result = await referralSystem.generateReferralCode(userId, customCode);
+
+    return {
+      success: result.success,
+      code: result.code,
+      message: result.message,
+      shareLink: result.code ? referralSystem.generateReferralLink(result.code) : null
+    };
+
+  } catch (error) {
+    console.error('Generate referral code error:', error);
+    throw new functions.https.HttpsError('internal', 'Failed to generate referral code');
+  }
+});
+
+/**
+ * Apply referral code during user signup
+ * HTTP Callable Function
+ */
+export const applyReferralCode = functions.https.onCall(async (data, context) => {
+  try {
+    if (!context.auth) {
+      throw new functions.https.HttpsError('unauthenticated', 'Must be authenticated');
+    }
+
+    const { referralCode, userEmail } = data;
+    const userId = context.auth.uid;
+
+    if (!referralCode) {
+      throw new functions.https.HttpsError('invalid-argument', 'Referral code is required');
+    }
+
+    const result = await referralSystem.applyReferralCode(userId, referralCode, userEmail);
+
+    return {
+      success: result.success,
+      referrerId: result.referrerId,
+      bonusAwarded: result.bonusAwarded,
+      message: result.message
+    };
+
+  } catch (error) {
+    console.error('Apply referral code error:', error);
+    throw new functions.https.HttpsError('internal', 'Failed to apply referral code');
+  }
+});
+
+/**
+ * Get referral analytics for user
+ * HTTP Callable Function
+ */
+export const getReferralAnalytics = functions.https.onCall(async (data, context) => {
+  try {
+    if (!context.auth) {
+      throw new functions.https.HttpsError('unauthenticated', 'Must be authenticated');
+    }
+
+    const userId = data.userId || context.auth.uid;
+
+    // Check if user is requesting their own analytics or has admin privileges
+    if (userId !== context.auth.uid && !context.auth.token?.admin) {
+      throw new functions.https.HttpsError('permission-denied', 'Can only access own referral analytics');
+    }
+
+    const result = await referralSystem.getReferralAnalytics(userId);
+
+    return {
+      success: result.success,
+      data: result.data,
+      message: result.message
+    };
+
+  } catch (error) {
+    console.error('Get referral analytics error:', error);
+    throw new functions.https.HttpsError('internal', 'Failed to get referral analytics');
+  }
+});
+
+/**
+ * Get referral leaderboard
+ * HTTP Callable Function
+ */
+export const getReferralLeaderboard = functions.https.onCall(async (data, context) => {
+  try {
+    const { limit = 10 } = data;
+
+    const result = await referralSystem.getReferralLeaderboard(limit);
+
+    return {
+      success: result.success,
+      data: result.data,
+      message: result.message
+    };
+
+  } catch (error) {
+    console.error('Get referral leaderboard error:', error);
+    throw new functions.https.HttpsError('internal', 'Failed to get referral leaderboard');
+  }
+});
+
+/**
+ * Generate shareable referral content
+ * HTTP Callable Function
+ */
+export const generateReferralShare = functions.https.onCall(async (data, context) => {
+  try {
+    if (!context.auth) {
+      throw new functions.https.HttpsError('unauthenticated', 'Must be authenticated');
+    }
+
+    const { referralCode, customMessage } = data;
+    const userId = context.auth.uid;
+
+    if (!referralCode) {
+      throw new functions.https.HttpsError('invalid-argument', 'Referral code is required');
+    }
+
+    // Get user info for personalized message
+    const userDoc = await db.collection('users').doc(userId).get();
+    const user = userDoc.exists ? userDoc.data() : null;
+    const username = user?.username || 'A friend';
+
+    const shareLink = referralSystem.generateReferralLink(referralCode);
+    const shareMessage = referralSystem.generateShareMessage(referralCode, username, customMessage);
+
+    // Generate QR code for easy sharing (simplified version)
+    const qrCodeData = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(shareLink)}`;
+
+    return {
+      success: true,
+      data: {
+        shareLink,
+        shareMessage,
+        qrCodeUrl: qrCodeData,
+        socialMedia: {
+          whatsapp: `https://wa.me/?text=${encodeURIComponent(shareMessage)}`,
+          telegram: `https://t.me/share/url?url=${encodeURIComponent(shareLink)}&text=${encodeURIComponent('Join me on ReelShare!')}`,
+          facebook: `https://www.facebook.com/sharer/sharer.php?u=${encodeURIComponent(shareLink)}`,
+          twitter: `https://twitter.com/intent/tweet?text=${encodeURIComponent('Join me on ReelShare!')}&url=${encodeURIComponent(shareLink)}`
+        }
+      },
+      message: 'Referral share content generated successfully'
+    };
+
+  } catch (error) {
+    console.error('Generate referral share error:', error);
+    throw new functions.https.HttpsError('internal', 'Failed to generate referral share');
+  }
+});
+
+/**
+ * Auto-process referral bonuses when user earns ad revenue
+ * Trigger: onCreate for wallet_transactions with ad_revenue subtype
+ */
+export const processReferralBonus = functions.firestore
+  .document('wallet_transactions/{transactionId}')
   .onCreate(async (snap, context) => {
-    const viewId = context.params.viewId;
-    const viewData = snap.data();
+    const transactionId = context.params.transactionId;
+    const transactionData = snap.data();
 
     try {
-      console.log(`Processing ad revenue for view: ${viewId}`);
-
-      // Get reel data to find the creator
-      const reelDoc = await db.collection('reels').doc(viewData.reelId).get();
-      if (!reelDoc.exists) {
-        console.log(`Reel ${viewData.reelId} not found, skipping ad revenue processing`);
+      // Only process referral bonuses for ad revenue earnings
+      if (transactionData.type !== 'earning' || transactionData.subType !== 'ad_revenue') {
         return;
       }
 
-      const reelInfo = reelDoc.data()!;
+      console.log(`Processing referral bonus for transaction: ${transactionId}`);
 
-      // Skip if no ad was shown
-      if (!viewData.adData) {
-        console.log(`No ad data for view ${viewId}, skipping revenue processing`);
-        return;
-      }
+      const result = await referralSystem.processReferralRevenue(
+        transactionData.userId,
+        transactionData.amount,
+        transactionId,
+        transactionData.reelId
+      );
 
-      // Prepare ad view data for processing
-      const adViewData = {
-        reelId: viewData.reelId,
-        userId: viewData.userId,
-        creatorId: reelInfo.userId,
-        viewDuration: viewData.duration || 0,
-        videoDuration: reelInfo.duration || 30,
-        adData: viewData.adData,
-        timestamp: viewData.timestamp || admin.firestore.FieldValue.serverTimestamp(),
-        viewQuality: calculateViewQuality(viewData),
-        userLocation: viewData.userLocation || 'IN'
-      };
-
-      // Process the ad revenue
-      const result = await adRevenueProcessor.processReelViewRevenue(adViewData);
-
-      if (result.success) {
-        console.log(`✅ Ad revenue processed successfully for view ${viewId}: ${result.message}`);
+      if (result.success && result.referralBonus) {
+        console.log(`✅ Referral bonus processed: ₹${result.referralBonus} awarded to ${result.referrerId}`);
         
-        // Update the view document with processing status
+        // Update the original transaction with referral info
         await snap.ref.update({
-          adRevenueProcessed: true,
-          adRevenueProcessedAt: admin.firestore.FieldValue.serverTimestamp(),
-          adRevenueDistribution: result.distribution,
-          adRevenueTransactionIds: result.transactionIds
+          referralProcessed: true,
+          referralBonus: result.referralBonus,
+          referrerId: result.referrerId
         });
-
-        // Track successful revenue processing for analytics
-        await db.collection('ad_revenue_analytics').add({
-          viewId,
-          reelId: viewData.reelId,
-          creatorId: reelInfo.userId,
-          viewerId: viewData.userId,
-          totalRevenue: result.distribution?.totalRevenue || 0,
-          processed: true,
-          timestamp: admin.firestore.FieldValue.serverTimestamp()
-        });
-
       } else {
-        console.log(`❌ Ad revenue processing failed for view ${viewId}: ${result.message}`);
-        
-        // Update view document with failure status
-        await snap.ref.update({
-          adRevenueProcessed: false,
-          adRevenueProcessedAt: admin.firestore.FieldValue.serverTimestamp(),
-          adRevenueError: result.message
-        });
+        console.log(`ℹ️ No referral bonus: ${result.message}`);
       }
 
     } catch (error) {
-      console.error(`Error processing ad revenue for view ${viewId}:`, error);
+      console.error(`Error processing referral bonus for transaction ${transactionId}:`, error);
       
-      // Update view document with error status
+      // Update transaction with error status
       await snap.ref.update({
-        adRevenueProcessed: false,
-        adRevenueProcessedAt: admin.firestore.FieldValue.serverTimestamp(),
-        adRevenueError: error instanceof Error ? error.message : 'Unknown error'
+        referralProcessed: false,
+        referralError: error instanceof Error ? error.message : 'Unknown error'
       });
     }
   });
