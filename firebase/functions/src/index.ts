@@ -868,6 +868,415 @@ const TOPIC_CATEGORIES = [
   'sports', 'gaming', 'business', 'health', 'pets', 'nature', 'diy', 'reviews'
 ];
 
+// ===== RECOMMENDATION SYSTEM FUNCTIONS =====
+
+/**
+ * Generate content embedding when a reel is uploaded
+ * Trigger: onCreate for reels collection
+ */
+export const generateContentEmbedding = functions.firestore
+  .document('reels/{reelId}')
+  .onCreate(async (snap, context) => {
+    const reelId = context.params.reelId;
+    const reelData = snap.data();
+
+    try {
+      console.log(`Generating embedding for reel: ${reelId}`);
+      
+      // Generate and store content embedding
+      const embedding = await recommendationEngine.generateContentEmbedding(reelId);
+      
+      if (embedding) {
+        console.log(`Successfully generated embedding for reel: ${reelId}`);
+        
+        // Also update user interactions to track content creation
+        await db.collection('user_interactions').add({
+          userId: reelData.userId,
+          reelId: reelId,
+          type: 'create',
+          timestamp: admin.firestore.FieldValue.serverTimestamp(),
+          weight: RECOMMENDATION_CONFIG.interactionWeights.create
+        });
+      }
+      
+    } catch (error) {
+      console.error(`Error generating embedding for reel ${reelId}:`, error);
+    }
+  });
+
+/**
+ * Track user interactions for recommendation engine
+ * HTTP Callable Function
+ */
+export const trackUserInteraction = functions.https.onCall(async (data, context) => {
+  try {
+    if (!context.auth) {
+      throw new functions.https.HttpsError('unauthenticated', 'Must be authenticated');
+    }
+
+    const { reelId, interactionType, duration } = data;
+    const userId = context.auth.uid;
+
+    // Validate interaction type
+    const validTypes = ['view', 'like', 'comment', 'share'];
+    if (!validTypes.includes(interactionType)) {
+      throw new functions.https.HttpsError('invalid-argument', 'Invalid interaction type');
+    }
+
+    // Create interaction record
+    const interactionData = {
+      userId,
+      reelId,
+      type: interactionType,
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      weight: RECOMMENDATION_CONFIG.interactionWeights[interactionType] || 1
+    };
+
+    // Add duration for view interactions
+    if (interactionType === 'view' && duration) {
+      interactionData.duration = duration;
+    }
+
+    await db.collection('user_interactions').add(interactionData);
+
+    return {
+      success: true,
+      message: 'Interaction tracked successfully'
+    };
+
+  } catch (error) {
+    console.error('Track interaction error:', error);
+    throw error;
+  }
+});
+
+/**
+ * Generate recommendations for a specific user
+ * HTTP Callable Function
+ */
+export const generateUserRecommendations = functions
+  .runWith({ timeoutSeconds: 540, memory: '2GB' })
+  .https.onCall(async (data, context) => {
+    try {
+      if (!context.auth) {
+        throw new functions.https.HttpsError('unauthenticated', 'Must be authenticated');
+      }
+
+      const userId = data.userId || context.auth.uid;
+      const forceRefresh = data.forceRefresh || false;
+
+      // Check if we have recent recommendations (unless forcing refresh)
+      if (!forceRefresh) {
+        const existingRec = await db.collection('user_recommendations').doc(userId).get();
+        if (existingRec.exists) {
+          const recData = existingRec.data()!;
+          const now = admin.firestore.Timestamp.now();
+          const ageInHours = (now.toMillis() - recData.generatedAt.toMillis()) / (60 * 60 * 1000);
+          
+          // Return existing recommendations if less than 6 hours old
+          if (ageInHours < 6) {
+            return {
+              success: true,
+              recommendations: recData.recommendations,
+              cached: true,
+              generatedAt: recData.generatedAt,
+              totalCount: recData.totalCount
+            };
+          }
+        }
+      }
+
+      // Generate new recommendations
+      console.log(`Generating recommendations for user: ${userId}`);
+      const recommendations = await recommendationEngine.generateUserRecommendations(userId);
+      
+      // Store recommendations
+      await recommendationEngine.storeUserRecommendations(userId, recommendations);
+
+      return {
+        success: true,
+        recommendations,
+        cached: false,
+        generatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        totalCount: recommendations.length
+      };
+
+    } catch (error) {
+      console.error('Generate recommendations error:', error);
+      throw new functions.https.HttpsError('internal', 'Failed to generate recommendations');
+    }
+  });
+
+/**
+ * Get user recommendations from cache
+ * HTTP Callable Function
+ */
+export const getUserRecommendations = functions.https.onCall(async (data, context) => {
+  try {
+    if (!context.auth) {
+      throw new functions.https.HttpsError('unauthenticated', 'Must be authenticated');
+    }
+
+    const userId = data.userId || context.auth.uid;
+    const limit = Math.min(data.limit || 20, 100);
+    const offset = data.offset || 0;
+
+    // Get cached recommendations
+    const userRecDoc = await db.collection('user_recommendations').doc(userId).get();
+    
+    if (!userRecDoc.exists) {
+      // Generate recommendations if none exist
+      const generateResult = await generateUserRecommendations.handler({ userId }, context as any);
+      return generateResult;
+    }
+
+    const recData = userRecDoc.data()!;
+    
+    // Check if recommendations are expired (older than 24 hours)
+    const now = admin.firestore.Timestamp.now();
+    const ageInHours = (now.toMillis() - recData.generatedAt.toMillis()) / (60 * 60 * 1000);
+    
+    if (ageInHours > 24) {
+      // Regenerate recommendations if expired
+      const generateResult = await generateUserRecommendations.handler({ userId }, context as any);
+      return generateResult;
+    }
+
+    // Return paginated recommendations
+    const paginatedRecs = recData.recommendations.slice(offset, offset + limit);
+
+    return {
+      success: true,
+      recommendations: paginatedRecs,
+      totalCount: recData.totalCount,
+      hasMore: offset + limit < recData.totalCount,
+      generatedAt: recData.generatedAt,
+      cached: true
+    };
+
+  } catch (error) {
+    console.error('Get recommendations error:', error);
+    throw new functions.https.HttpsError('internal', 'Failed to get recommendations');
+  }
+});
+
+/**
+ * Daily scheduled job to generate recommendations for all active users
+ * Runs every day at 2:00 AM UTC
+ */
+export const dailyRecommendationJob = functions
+  .runWith({ timeoutSeconds: 540, memory: '2GB' })
+  .pubsub.schedule('0 2 * * *')
+  .timeZone('UTC')
+  .onRun(async (context) => {
+    try {
+      console.log('Starting daily recommendation generation job...');
+      
+      const batchSize = 50; // Process users in batches
+      let processedUsers = 0;
+      let totalUsers = 0;
+      
+      // Get all users who have interacted in the last 7 days
+      const cutoffDate = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+      const activeUsersQuery = await db.collection('user_interactions')
+        .where('timestamp', '>=', admin.firestore.Timestamp.fromDate(cutoffDate))
+        .select('userId')
+        .get();
+
+      // Get unique user IDs
+      const userIds = [...new Set(activeUsersQuery.docs.map(doc => doc.data().userId))];
+      totalUsers = userIds.length;
+      
+      console.log(`Found ${totalUsers} active users to process`);
+
+      // Process users in batches
+      for (let i = 0; i < userIds.length; i += batchSize) {
+        const batch = userIds.slice(i, i + batchSize);
+        
+        const batchPromises = batch.map(async (userId) => {
+          try {
+            const recommendations = await recommendationEngine.generateUserRecommendations(userId);
+            if (recommendations.length > 0) {
+              await recommendationEngine.storeUserRecommendations(userId, recommendations);
+              return true;
+            }
+            return false;
+          } catch (error) {
+            console.error(`Error generating recommendations for user ${userId}:`, error);
+            return false;
+          }
+        });
+
+        const results = await Promise.all(batchPromises);
+        const successCount = results.filter(success => success).length;
+        processedUsers += successCount;
+        
+        console.log(`Processed batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(userIds.length / batchSize)}: ${successCount}/${batch.length} successful`);
+        
+        // Small delay between batches to avoid overwhelming the system
+        if (i + batchSize < userIds.length) {
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+      }
+
+      // Log job completion stats
+      await db.collection('recommendation_jobs').add({
+        type: 'daily_generation',
+        startTime: admin.firestore.Timestamp.fromDate(new Date(context.timestamp)),
+        endTime: admin.firestore.FieldValue.serverTimestamp(),
+        totalUsers,
+        processedUsers,
+        successRate: totalUsers > 0 ? (processedUsers / totalUsers) * 100 : 0,
+        status: 'completed'
+      });
+
+      console.log(`Daily recommendation job completed. Processed ${processedUsers}/${totalUsers} users successfully.`);
+      return null;
+
+    } catch (error) {
+      console.error('Daily recommendation job error:', error);
+      
+      // Log failed job
+      await db.collection('recommendation_jobs').add({
+        type: 'daily_generation',
+        startTime: admin.firestore.Timestamp.fromDate(new Date(context.timestamp)),
+        endTime: admin.firestore.FieldValue.serverTimestamp(),
+        error: error.message,
+        status: 'failed'
+      });
+      
+      throw error;
+    }
+  });
+
+/**
+ * Regenerate embeddings for existing content (maintenance function)
+ * HTTP Callable Function
+ */
+export const regenerateContentEmbeddings = functions
+  .runWith({ timeoutSeconds: 540, memory: '2GB' })
+  .https.onCall(async (data, context) => {
+    try {
+      // Check admin authentication
+      if (!context.auth || !context.auth.token.admin) {
+        throw new functions.https.HttpsError('permission-denied', 'Admin access required');
+      }
+
+      const limit = data.limit || 100;
+      const startAfter = data.startAfter || null;
+
+      let query = db.collection('reels')
+        .where('isActive', '==', true)
+        .orderBy('createdAt', 'desc')
+        .limit(limit);
+
+      if (startAfter) {
+        query = query.startAfter(startAfter);
+      }
+
+      const reelsSnapshot = await query.get();
+      let processed = 0;
+      let errors = 0;
+
+      for (const doc of reelsSnapshot.docs) {
+        try {
+          await recommendationEngine.generateContentEmbedding(doc.id);
+          processed++;
+        } catch (error) {
+          console.error(`Error generating embedding for reel ${doc.id}:`, error);
+          errors++;
+        }
+      }
+
+      return {
+        success: true,
+        processed,
+        errors,
+        hasMore: reelsSnapshot.docs.length === limit,
+        lastDocument: reelsSnapshot.docs.length > 0 ? reelsSnapshot.docs[reelsSnapshot.docs.length - 1].id : null
+      };
+
+    } catch (error) {
+      console.error('Regenerate embeddings error:', error);
+      throw error;
+    }
+  });
+
+/**
+ * Get recommendation analytics for admin dashboard
+ * HTTP Callable Function
+ */
+export const getRecommendationAnalytics = functions.https.onCall(async (data, context) => {
+  try {
+    if (!context.auth || !context.auth.token.admin) {
+      throw new functions.https.HttpsError('permission-denied', 'Admin access required');
+    }
+
+    const { startDate, endDate } = data;
+
+    // Get recommendation job statistics
+    let jobQuery = db.collection('recommendation_jobs')
+      .orderBy('startTime', 'desc')
+      .limit(30); // Last 30 jobs
+
+    if (startDate) {
+      jobQuery = jobQuery.where('startTime', '>=', new Date(startDate));
+    }
+    if (endDate) {
+      jobQuery = jobQuery.where('startTime', '<=', new Date(endDate));
+    }
+
+    const jobsSnapshot = await jobQuery.get();
+    const jobs = jobsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
+    // Get recommendation statistics
+    const recommendationsSnapshot = await db.collection('user_recommendations').get();
+    const totalRecommendations = recommendationsSnapshot.size;
+
+    // Calculate average scores
+    let totalScore = 0;
+    let totalRecommendationCount = 0;
+
+    recommendationsSnapshot.docs.forEach(doc => {
+      const data = doc.data();
+      if (data.averageScore) {
+        totalScore += data.averageScore * data.totalCount;
+        totalRecommendationCount += data.totalCount;
+      }
+    });
+
+    const averageScore = totalRecommendationCount > 0 ? totalScore / totalRecommendationCount : 0;
+
+    // Get content embedding statistics
+    const embeddingsSnapshot = await db.collection('content_embeddings').get();
+    const totalEmbeddings = embeddingsSnapshot.size;
+
+    const analytics = {
+      totalUsers: totalRecommendations,
+      totalContentEmbeddings: totalEmbeddings,
+      averageRecommendationScore: averageScore,
+      recentJobs: jobs,
+      lastJobDate: jobs.length > 0 ? jobs[0].startTime : null,
+      systemHealth: {
+        embeddingCoverage: totalEmbeddings > 0 ? 'Good' : 'Poor',
+        recommendationFreshness: jobs.length > 0 && jobs[0].status === 'completed' ? 'Good' : 'Poor'
+      }
+    };
+
+    return {
+      success: true,
+      data: analytics,
+      message: 'Analytics retrieved successfully'
+    };
+
+  } catch (error) {
+    console.error('Recommendation analytics error:', error);
+    throw new functions.https.HttpsError('internal', 'Failed to get analytics');
+  }
+});
+
+// ===== EXISTING FUNCTIONS (keeping all previous functions) =====
+
 // Process video analysis with AI
 export const processVideoAnalysis = functions.https.onCall(async (data, context) => {
   try {
@@ -1697,9 +2106,31 @@ export const cleanupOldData = functions.pubsub.schedule('every 7 days').onRun(as
       batch.delete(doc.ref);
     });
 
+    // Clean up old user interactions (keep only last 60 days)
+    const sixtyDaysAgo = admin.firestore.Timestamp.fromMillis(now.toMillis() - 60 * 24 * 60 * 60 * 1000);
+    const oldInteractionsQuery = db.collection('user_interactions')
+      .where('timestamp', '<', sixtyDaysAgo)
+      .limit(1000);
+
+    const oldInteractionsSnapshot = await oldInteractionsQuery.get();
+    oldInteractionsSnapshot.docs.forEach(doc => {
+      batch.delete(doc.ref);
+    });
+
+    // Clean up expired recommendations (older than 7 days)
+    const sevenDaysAgo = admin.firestore.Timestamp.fromMillis(now.toMillis() - 7 * 24 * 60 * 60 * 1000);
+    const oldRecommendationsQuery = db.collection('user_recommendations')
+      .where('generatedAt', '<', sevenDaysAgo)
+      .limit(500);
+
+    const oldRecommendationsSnapshot = await oldRecommendationsQuery.get();
+    oldRecommendationsSnapshot.docs.forEach(doc => {
+      batch.delete(doc.ref);
+    });
+
     await batch.commit();
 
-    console.log(`Cleaned up ${oldEventsSnapshot.docs.length} old ad revenue events`);
+    console.log(`Cleaned up ${oldEventsSnapshot.docs.length} old ad revenue events, ${oldInteractionsSnapshot.docs.length} old interactions, and ${oldRecommendationsSnapshot.docs.length} old recommendations`);
     return null;
 
   } catch (error) {
