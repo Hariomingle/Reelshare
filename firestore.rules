@@ -1,0 +1,123 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Users can read and write their own user document
+    match /users/{userId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+    
+    // Users can read all reels, but only write their own
+    match /reels/{reelId} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+    
+    // Users can read and write their own wallet
+    match /wallets/{userId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+    
+    // Users can read and write their own wallet transactions
+    match /wallet_transactions/{transactionId} {
+      allow read, write: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+    
+    // Users can read and write their own analytics
+    match /user_analytics/{userId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+    
+    // Users can read and write their own interests
+    match /user_interests/{userId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+    
+    // Users can read and write their own interactions
+    match /user_interactions/{interactionId} {
+      allow read, write: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+    
+    // Users can read recommendations for themselves
+    match /user_recommendations/{userId} {
+      allow read: if request.auth != null && request.auth.uid == userId;
+      allow write: if false; // Only Cloud Functions can write recommendations
+    }
+    
+    // Content embeddings are read-only for users
+    match /content_embeddings/{embeddingId} {
+      allow read: if request.auth != null;
+      allow write: if false; // Only Cloud Functions can write embeddings
+    }
+    
+    // Referral codes - users can read all, but only write their own
+    match /referral_codes/{codeId} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null && request.auth.uid == resource.data.userId;
+    }
+    
+    // Referral relationships - users can read their own (as referrer or referee)
+    match /referral_relationships/{relationshipId} {
+      allow read: if request.auth != null && 
+        (request.auth.uid == resource.data.referrerId || 
+         request.auth.uid == resource.data.refereeId);
+      allow write: if false; // Only Cloud Functions can manage relationships
+    }
+    
+    // Referral stats - users can read their own
+    match /referral_stats/{userId} {
+      allow read: if request.auth != null && request.auth.uid == userId;
+      allow write: if false; // Only Cloud Functions can update stats
+    }
+    
+    // Referral earnings - users can read their own
+    match /referral_earnings/{earningId} {
+      allow read: if request.auth != null && 
+        (request.auth.uid == resource.data.referrerId || 
+         request.auth.uid == resource.data.refereeId);
+      allow write: if false; // Only Cloud Functions can create earnings
+    }
+    
+    // Ad revenue events - read-only for users
+    match /ad_revenue_events/{eventId} {
+      allow read: if request.auth != null && 
+        (request.auth.uid == resource.data.creatorId || 
+         request.auth.uid == resource.data.viewerId);
+      allow write: if false; // Only Cloud Functions can create events
+    }
+    
+    // Reel views - users can create their own view records
+    match /reel_views/{viewId} {
+      allow read: if request.auth != null && request.auth.uid == resource.data.userId;
+      allow create: if request.auth != null && request.auth.uid == request.resource.data.userId;
+      allow update, delete: if false; // Only Cloud Functions can update views
+    }
+    
+    // Daily streaks - users can read and write their own
+    match /daily_streaks/{userId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+    
+    // Admin-only collections
+    match /admin/{document=**} {
+      allow read, write: if request.auth != null && 
+        request.auth.token.admin == true;
+    }
+    
+    // System collections - read-only for authenticated users
+    match /app_config/{configId} {
+      allow read: if request.auth != null;
+      allow write: if false;
+    }
+    
+    // Trending content - read-only for users
+    match /trending_reels/{trendingId} {
+      allow read: if request.auth != null;
+      allow write: if false;
+    }
+    
+    // Block all other access by default
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+} 
